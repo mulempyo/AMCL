@@ -172,7 +172,7 @@ class AmclNode
     bool setMapCallback(nav_msgs::SetMap::Request& req,
                         nav_msgs::SetMap::Response& res);
 
-    void boundingBoxes3dReceived(const std_msgs::Float64 pottedplant);
+    void boundingBoxes3dReceived(const geometry_msgs::PoseStamped camera);
     void laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan);
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
@@ -271,6 +271,7 @@ class AmclNode
     amcl_hyp_t* initial_pose_hyp_;
     bool first_map_received_;
     bool first_reconfigure_call_;
+    bool modify = false;
 
     boost::recursive_mutex configuration_mutex_;
     dynamic_reconfigure::Server<amcl::AMCLConfig> *dsrv_;
@@ -288,6 +289,10 @@ class AmclNode
     odom_model_t odom_model_type_;
     double init_pose_[3];
     double init_cov_[3];
+   
+    float camera_x;
+    float camera_y;
+    float camera_yaw;
     laser_model_t laser_model_type_;
     bool tf_broadcast_;
     bool selective_resampling_;
@@ -1124,26 +1129,27 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 }
 
 void
-AmclNode::boundingBoxes3dReceived(const std_msgs::Float64 pottedplant){
-   float camera_x = detect_object_.cameraX();
-   float camera_y = detect_object_.cameraY();
-   float camera_yaw = detect_object_.cameraYaw();
+AmclNode::boundingBoxes3dReceived(const geometry_msgs::PoseStamped camera){
 
+   camera_x = camera.pose.position.x;
+   camera_y = camera.pose.position.y;
+   
    geometry_msgs::PoseStamped camera_point;
    camera_point.header.frame_id = "camera_link";
-   camera_point.header.stamp = ros::Time(0);
+   camera_point.header.stamp = ros::Time::now();
    camera_point.pose.position.x = camera_x;
    camera_point.pose.position.y = camera_y;
 
-   tf2::Quaternion q;
-   q.setRPY(0,0,camera_yaw);
-   camera_point.pose.orientation.x = q.x();
-   camera_point.pose.orientation.y = q.y();
-   camera_point.pose.orientation.z = q.z();
-   camera_point.pose.orientation.w = q.w();
+   camera_point.pose.orientation.x = camera.pose.orientation.x;
+   camera_point.pose.orientation.y = camera.pose.orientation.y;
+   camera_point.pose.orientation.z = camera.pose.orientation.z;
+   camera_point.pose.orientation.w = camera.pose.orientation.w;
 
-   geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time(0), ros::Duration(1.0));
+   ROS_WARN("amcl x:%f,y:%f, yaw:%f",camera_x,camera_y);
+
+   geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time::now(), ros::Duration(1.0));
    tf2::doTransform(camera_point, camera_to_laser_point, transformStamped);
+   modify = true;
  
 }
 
@@ -1425,13 +1431,16 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       p.header.frame_id = global_frame_id_;
       p.header.stamp = laser_scan->header.stamp;
 
-      hyps[max_weight_hyp].pf_pose_mean.v[0] += (camera_to_laser_point.pose.position.x - hyps[max_weight_hyp].pf_pose_mean.v[0]);
-      hyps[max_weight_hyp].pf_pose_mean.v[1] += (camera_to_laser_point.pose.position.y - hyps[max_weight_hyp].pf_pose_mean.v[1]);
+      if(modify){
+      hyps[max_weight_hyp].pf_pose_mean.v[0] = camera_to_laser_point.pose.position.x;
+      hyps[max_weight_hyp].pf_pose_mean.v[1] = camera_to_laser_point.pose.position.y;
+      }
 
+      modify = false;
       // Copy in the pose
       p.pose.pose.position.x = hyps[max_weight_hyp].pf_pose_mean.v[0];
       p.pose.pose.position.y = hyps[max_weight_hyp].pf_pose_mean.v[1];
-
+      
       tf2::Quaternion q;
       q.setRPY(0, 0, hyps[max_weight_hyp].pf_pose_mean.v[2]);
       tf2::convert(q, p.pose.pose.orientation);
