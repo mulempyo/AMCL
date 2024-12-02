@@ -20,11 +20,6 @@
 
 /* Author: Brian Gerkey */
 
-/*
-/camera/depth/image_rect_raw: 깊이 이미지를 사용하여 장애물 정보를 얻고, AMCL에 사용할 수 있도록 레이저 스캔 형식으로 변환하는 방식이 가능합니다.
-/camera/color/image_raw: 컬러 이미지 데이터로 비전 기반의 기능(예: 특징 기반 SLAM 등)을 추가로 사용할 수 있습니다.
-*/
-
 #include <algorithm>
 #include <vector>
 #include <map>
@@ -57,9 +52,6 @@
 #include "nav_msgs/GetMap.h"
 #include "nav_msgs/SetMap.h"
 #include "std_srvs/Empty.h"
-#include <sensor_msgs/Image.h>
-#include <cv_bridge/cv_bridge.h>
-#include <opencv2/opencv.hpp>
 
 // For transform support
 #include "tf2/LinearMath/Transform.h"
@@ -83,6 +75,8 @@
 
 // For monitoring the estimator
 #include <diagnostic_updater/diagnostic_updater.h>
+
+#include <detect_object/detect_object.h>
 
 #define NEW_UNIFORM_SAMPLING 1
 
@@ -178,7 +172,7 @@ class AmclNode
     bool setMapCallback(nav_msgs::SetMap::Request& req,
                         nav_msgs::SetMap::Response& res);
 
-    void depthCallback(const sensor_msgs::ImageConstPtr& msg);
+    void boundingBoxes3dReceived(const std_msgs::Float64 pottedplant);
     void laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan);
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
@@ -190,13 +184,13 @@ class AmclNode
     void updatePoseFromServer();
     void applyInitialPose();
 
-    //parameter for which odom to use
+    //parameter for what odom to use
     std::string odom_frame_id_;
 
     //paramater to store latest odom pose
     geometry_msgs::PoseStamped latest_odom_pose_;
 
-    //parameter for which base to use
+    //parameter for what base to use
     std::string base_frame_id_;
     std::string global_frame_id_;
 
@@ -208,6 +202,7 @@ class AmclNode
     ros::Duration save_pose_period;
 
     geometry_msgs::PoseWithCovarianceStamped last_published_pose;
+    geometry_msgs::PoseStamped camera_to_laser_point;
 
     map_t* map_;
     char* mapdata;
@@ -217,7 +212,6 @@ class AmclNode
     message_filters::Subscriber<sensor_msgs::LaserScan>* laser_scan_sub_;
     tf2_ros::MessageFilter<sensor_msgs::LaserScan>* laser_scan_filter_;
     ros::Subscriber initial_pose_sub_;
-    ros::Subscriber camera_sub_;
     std::vector< AMCLLaser* > lasers_;
     std::vector< bool > lasers_update_;
     std::map< std::string, int > frame_to_laser_;
@@ -245,11 +239,6 @@ class AmclNode
     // For slowing play-back when reading directly from a bag file
     ros::WallDuration bag_scan_period_;
 
-    bool depth=false;
-    float camera_weight;
-    float lidar_weight = 1.0 - camera_weight;
-    geometry_msgs::PoseStamped camera_to_laser_point;
-
     void requestMap();
 
     // Helper to get odometric pose from transform system
@@ -270,7 +259,9 @@ class AmclNode
     ros::ServiceServer set_map_srv_;
     ros::Subscriber initial_pose_sub_old_;
     ros::Subscriber map_sub_;
+    ros::Subscriber boundBox_sub_;
 
+    detect::Detect detect_object_;
     diagnostic_updater::Updater diagnosic_updater_;
     void standardDeviationDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& diagnostic_status);
     double std_warn_level_x_;
@@ -299,8 +290,6 @@ class AmclNode
     double init_cov_[3];
     laser_model_t laser_model_type_;
     bool tf_broadcast_;
-    bool force_update_after_initialpose_;
-    bool force_update_after_set_map_;
     bool selective_resampling_;
 
     void reconfigureCB(amcl::AMCLConfig &config, uint32_t level);
@@ -462,8 +451,6 @@ AmclNode::AmclNode() :
   private_nh_.param("recovery_alpha_slow", alpha_slow_, 0.001);
   private_nh_.param("recovery_alpha_fast", alpha_fast_, 0.1);
   private_nh_.param("tf_broadcast", tf_broadcast_, true);
-  private_nh_.param("force_update_after_initialpose", force_update_after_initialpose_, false);
-  private_nh_.param("force_update_after_set_map", force_update_after_set_map_, false);
 
   // For diagnostics
   private_nh_.param("std_warn_level_x", std_warn_level_x_, 0.2);
@@ -508,7 +495,8 @@ AmclNode::AmclNode() :
                                                    this, _1));
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
 
-  camera_sub_ = nh_.subscribe("/camera/depth/image_rect_raw", 2, &AmclNode::depthCallback, this);
+  boundBox_sub_ = nh_.subscribe("object_detection_true", 10, &AmclNode::boundingBoxes3dReceived, this);
+
   if(use_map_topic_) {
     map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
     ROS_INFO("Subscribed to map topic.");
@@ -604,8 +592,6 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
   alpha_slow_ = config.recovery_alpha_slow;
   alpha_fast_ = config.recovery_alpha_fast;
   tf_broadcast_ = config.tf_broadcast;
-  force_update_after_initialpose_ = config.force_update_after_initialpose;
-  force_update_after_set_map_ = config.force_update_after_set_map;
 
   do_beamskip_= config.do_beamskip; 
   beam_skip_distance_ = config.beam_skip_distance; 
@@ -718,7 +704,7 @@ void AmclNode::runFromBag(const std::string &in_bag_fn, bool trigger_global_loca
         break;
       }
     }
-    ROS_INFO("Waiting for the map...");
+    ROS_INFO("Waiting for map...");
     ros::getGlobalCallbackQueue()->callAvailable(ros::WallDuration(1.0));
   }
 
@@ -998,7 +984,7 @@ AmclNode::freeMapDependentMemory()
 
 /**
  * Convert an OccupancyGrid map message into the internal
- * representation. This allocates a map_t and returns it.
+ * representation.  This allocates a map_t and returns it.
  */
 map_t*
 AmclNode::convertMap( const nav_msgs::OccupancyGrid& map_msg )
@@ -1050,7 +1036,7 @@ AmclNode::getOdomPose(geometry_msgs::PoseStamped& odom_pose,
   {
     this->tf_->transform(ident, odom_pose, odom_frame_id_);
   }
-  catch(const tf2::TransformException& e)
+  catch(tf2::TransformException e)
   {
     ROS_WARN("Failed to compute odom pose, skipping scan (%s)", e.what());
     return false;
@@ -1133,74 +1119,33 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 {
   handleMapMessage(req.map);
   handleInitialPoseMessage(req.initial_pose);
-  if (force_update_after_set_map_)
-  {
-    m_force_update = true;
-  }
   res.success = true;
   return true;
 }
 
-void 
-AmclNode::depthCallback(const sensor_msgs::ImageConstPtr& msg)
-    {
-        // if some image detected, depth = true;
-        depth = false;
-        cv_bridge::CvImagePtr cv_ptr;
-        try
-        {
-            cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_32FC1);
-        }
-        catch (cv_bridge::Exception& e)
-        {
-            ROS_ERROR("cv_bridge exception: %s", e.what());
-            return;
-        }
-      
-        // Camera intrinsic parameters (example values, adjust based on your camera's calibration)
-        const float fx = 615.0; // focal length in pixels (x-axis)
-        const float fy = 615.0; // focal length in pixels (y-axis)
-        const float cx = 320.0; // principal point x-coordinate
-        const float cy = 240.0; // principal point y-coordinate
+void
+AmclNode::boundingBoxes3dReceived(const std_msgs::Float64 pottedplant){
+   float camera_x = detect_object_.cameraX();
+   float camera_y = detect_object_.cameraY();
+   float camera_yaw = detect_object_.cameraYaw();
 
-        // 깊이 이미지에서 관심 물체의 픽셀 좌표 선택 (여기서는 예시로 중심부 사용)
-        int u = cv_ptr->image.cols / 2; // x 좌표 (픽셀)
-        int v = cv_ptr->image.rows / 2; // y 좌표 (픽셀)
-        
-        // 픽셀에서 깊이 값(거리) 추출
-        float depth_value = cv_ptr->image.at<float>(v, u);
-        if (std::isnan(depth_value) || depth_value <= 0.0f)
-        {
-            ROS_WARN("Invalid depth value at (%d, %d)", u, v);
-            return;
-        }
-  
-        if (depth_value <= 0.0f)
-        {
-            ROS_WARN("Invalid depth value");
-            return;
-        }
+   geometry_msgs::PoseStamped camera_point;
+   camera_point.header.frame_id = "camera_link";
+   camera_point.header.stamp = ros::Time(0);
+   camera_point.pose.position.x = camera_x;
+   camera_point.pose.position.y = camera_y;
 
-         // Calculate x, y coordinates in the camera's frame
-        float x = (u - cx) * depth_value / fx;
-        float y = (v - cy) * depth_value / fy;
+   tf2::Quaternion q;
+   q.setRPY(0,0,camera_yaw);
+   camera_point.pose.orientation.x = q.x();
+   camera_point.pose.orientation.y = q.y();
+   camera_point.pose.orientation.z = q.z();
+   camera_point.pose.orientation.w = q.w();
 
-        geometry_msgs::PoseStamped camera_point;
-        camera_point.header.frame_id = "camera_link"; // Frame of the camera
-        camera_point.header.stamp = ros::Time(0); // Use latest transform available
-        camera_point.pose.position.x = x;
-        camera_point.pose.position.y = y;
-
-        geometry_msgs::PoseStamped camera_to_laser_point;
-        geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time(0), ros::Duration(1.0));
-        tf2::doTransform(camera_point, camera_to_laser_point, transformStamped);
-
-        if(depth){
-          camera_weight = 1.0;
-        }else{
-        camera_weight = 0;
-        }
-    }
+   geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time(0), ros::Duration(1.0));
+   tf2::doTransform(camera_point, camera_to_laser_point, transformStamped);
+ 
+}
 
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
@@ -1231,7 +1176,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     {
       this->tf_->transform(ident, laser_pose, base_frame_id_);
     }
-    catch(const tf2::TransformException& e)
+    catch(tf2::TransformException& e)
     {
       ROS_ERROR("Couldn't transform from %s to %s, "
                 "even though the message notifier is in use",
@@ -1354,7 +1299,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       tf_->transform(min_q, min_q, base_frame_id_);
       tf_->transform(inc_q, inc_q, base_frame_id_);
     }
-    catch(const tf2::TransformException& e)
+    catch(tf2::TransformException& e)
     {
       ROS_WARN("Unable to transform min/max laser angles into base frame: %s",
                e.what());
@@ -1379,12 +1324,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       range_min = std::max(laser_scan->range_min, (float)laser_min_range_);
     else
       range_min = laser_scan->range_min;
-
-    if(ldata.range_max <= 0.0 || range_min < 0.0) {
-      ROS_ERROR("range_max or range_min from laser is negative! ignore this message.");
-      return; // ignore this.
-    }
-
     // The AMCLLaserData destructor will free this memory
     ldata.ranges = new double[ldata.range_count][2];
     ROS_ASSERT(ldata.ranges);
@@ -1394,8 +1333,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       // readings to max range.
       if(laser_scan->ranges[i] <= range_min)
         ldata.ranges[i][0] = ldata.range_max;
-      else if(laser_scan->ranges[i] > ldata.range_max)
-        ldata.ranges[i][0] = std::numeric_limits<decltype(ldata.range_max)>::max();
       else
         ldata.ranges[i][0] = laser_scan->ranges[i];
       // Compute bearing
@@ -1487,9 +1424,13 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       // Fill in the header
       p.header.frame_id = global_frame_id_;
       p.header.stamp = laser_scan->header.stamp;
+
+      hyps[max_weight_hyp].pf_pose_mean.v[0] += (camera_to_laser_point.pose.position.x - hyps[max_weight_hyp].pf_pose_mean.v[0]);
+      hyps[max_weight_hyp].pf_pose_mean.v[1] += (camera_to_laser_point.pose.position.y - hyps[max_weight_hyp].pf_pose_mean.v[1]);
+
       // Copy in the pose
-      p.pose.pose.position.x = lidar_weight*hyps[max_weight_hyp].pf_pose_mean.v[0] + camera_weight*camera_to_laser_point.pose.position.x;
-      p.pose.pose.position.y = lidar_weight*hyps[max_weight_hyp].pf_pose_mean.v[1] + camera_weight*camera_to_laser_point.pose.position.y;
+      p.pose.pose.position.x = hyps[max_weight_hyp].pf_pose_mean.v[0];
+      p.pose.pose.position.y = hyps[max_weight_hyp].pf_pose_mean.v[1];
 
       tf2::Quaternion q;
       q.setRPY(0, 0, hyps[max_weight_hyp].pf_pose_mean.v[2]);
@@ -1546,7 +1487,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 
         this->tf_->transform(tmp_tf_stamped, odom_to_map, odom_frame_id_);
       }
-      catch(const tf2::TransformException&)
+      catch(tf2::TransformException)
       {
         ROS_DEBUG("Failed to subtract base to odom transform");
         return;
@@ -1609,10 +1550,6 @@ void
 AmclNode::initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg)
 {
   handleInitialPoseMessage(*msg);
-  if (force_update_after_initialpose_)
-  {
-    m_force_update = true;
-  }
 }
 
 void
@@ -1638,12 +1575,13 @@ AmclNode::handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStampe
   geometry_msgs::TransformStamped tx_odom;
   try
   {
+    ros::Time now = ros::Time::now();
     // wait a little for the latest tf to become available
     tx_odom = tf_->lookupTransform(base_frame_id_, msg.header.stamp,
                                    base_frame_id_, ros::Time::now(),
                                    odom_frame_id_, ros::Duration(0.5));
   }
-  catch(const tf2::TransformException& e)
+  catch(tf2::TransformException e)
   {
     // If we've never sent a transform, then this is normal, because the
     // global_frame_id_ frame doesn't exist.  We only care about in-time
@@ -1731,70 +1669,3 @@ AmclNode::standardDeviationDiagnostics(diagnostic_updater::DiagnosticStatusWrapp
     diagnostic_status.summary(diagnostic_msgs::DiagnosticStatus::OK, "OK");
   }
 }
-
-/*
-1. AmclNode::AmclNode()
-목적: AmclNode 클래스의 생성자입니다.
-기능: 파라미터 초기화, 동적 재구성 콜백 설정, 구독자, 발행자 및 입자 필터, 센서(예: 레이저와 오도메트리) 및 TF 리스너와 브로드캐스터 등의 멤버를 설정합니다.
-2. AmclNode::~AmclNode()
-목적: AmclNode 클래스의 소멸자입니다.
-기능: 사용한 메모리와 리소스를 해제하며, 입자 필터, 레이저 필터, 맵 데이터를 정리합니다.
-3. void AmclNode::runFromBag(const std::string &in_bag_fn, bool trigger_global_localization = false)
-목적: 지정된 ROS 백 파일로부터 AMCL을 실행합니다.
-기능: 백 파일에서 메시지를 읽어들이고, 이를 수신 메시지처럼 처리하며, 필요 시 전역 로컬라이제이션을 시작하기 전에 실행합니다.
-4. void AmclNode::savePoseToServer()
-목적: 마지막 위치를 ROS 파라미터 서버에 저장합니다.
-기능: 마지막 변환을 적용하여 현재 맵에서의 로봇 위치를 결정하고 이를 파라미터 서버에 저장합니다.
-5. void AmclNode::updatePoseFromServer()
-목적: 초기 위치와 공분산을 파라미터 서버에서 불러옵니다.
-기능: 로봇의 초기 위치 및 공분산과 관련된 파라미터를 읽고 상태를 초기화하거나 업데이트합니다.
-6. void AmclNode::checkLaserReceived(const ros::TimerEvent& event)
-목적: 레이저 데이터가 수신되었는지 확인하는 타이머 콜백입니다.
-기능: 지정된 간격 동안 레이저 데이터가 수신되지 않으면 경고 메시지를 출력합니다.
-7. void AmclNode::requestMap()
-목적: ROS 서비스 호출을 통해 맵을 요청합니다.
-기능: static_map 서비스를 호출하여 맵을 요청합니다.
-8. void AmclNode::mapReceived(const nav_msgs::OccupancyGridConstPtr& msg)
-목적: 수신된 맵 메시지를 처리합니다.
-기능: 맵 메시지를 내부 map_t 형식으로 변환하고, 입자 필터를 맵 데이터를 사용하여 설정합니다.
-9. void AmclNode::handleMapMessage(const nav_msgs::OccupancyGrid& msg)
-목적: 주어진 맵 메시지를 처리하고 내부 구조를 업데이트합니다.
-기능: 맵 메시지를 변환하고, 입자 필터를 초기화하며 센서를 설정합니다.
-10. void AmclNode::freeMapDependentMemory()
-목적: 맵 및 맵에 종속된 구조체에 사용된 메모리를 해제합니다.
-기능: 맵 및 입자 필터에 사용된 메모리를 정리합니다.
-11. map_t* AmclNode::convertMap(const nav_msgs::OccupancyGrid& map_msg)
-목적: nav_msgs::OccupancyGrid 메시지를 내부 map_t 구조로 변환합니다.
-기능: ROS 맵 메시지를 내부 입자 필터 구현과 호환되는 형식으로 변환합니다.
-12. bool AmclNode::getOdomPose(...)
-목적: 오도메트리 프레임에서 로봇의 현재 위치를 가져옵니다.
-기능: TF 변환을 사용하여 지정된 프레임에 대한 로봇의 위치를 가져옵니다.
-13. pf_vector_t AmclNode::uniformPoseGenerator(void* arg)
-목적: 맵에서 자유 공간 내에 랜덤하게 균일한 위치를 생성합니다.
-기능: 맵에서 랜덤하게 위치를 샘플링하며, 자유 공간에 위치해야 합니다.
-14. bool AmclNode::globalLocalizationCallback(...)
-목적: 전역 로컬라이제이션을 위한 서비스 콜백입니다.
-기능: 전체 맵에 대한 균일 분포로 입자 필터를 재초기화합니다.
-15. bool AmclNode::nomotionUpdateCallback(...)
-목적: 모션 없이 입자 업데이트를 강제로 수행합니다.
-기능: 로봇이 이동하지 않더라도 AMCL이 업데이트를 수행하도록 강제합니다.
-16. bool AmclNode::setMapCallback(...)
-목적: 맵을 업데이트하는 서비스 콜백입니다.
-기능: 수신된 맵 데이터를 처리하고 초기 위치를 설정하며, 필요 시 강제로 업데이트합니다.
-17. void AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
-목적: 레이저 스캔 메시지를 처리합니다.
-기능: 수신된 레이저 스캔 데이터를 사용하여 입자 필터를 업데이트하고, 필요 시 입자를 재샘플링하며 필터링된 위치를 발행합니다.
-18. void AmclNode::initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg)
-목적: 초기 위치 추정에 대한 콜백입니다.
-기능: 수신된 메시지를 기반으로 로봇의 초기 위치를 설정합니다.
-19. void AmclNode::handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg)
-목적: 초기 위치 메시지를 처리합니다.
-기능: 수신된 초기 위치를 적용하고 입자 필터를 업데이트합니다.
-20. void AmclNode::applyInitialPose()
-목적: 초기 위치 추정을 입자 필터에 적용합니다.
-기능: 초기 위치와 공분산을 사용하여 입자 필터를 재초기화합니다.
-21. void AmclNode::standardDeviationDiagnostics(...)
-목적: 위치의 표준 편차와 관련된 진단 정보를 발행합니다.
-기능: x, y, yaw 위치의 표준 편차를 계산하고 경고 임계값을 초과할 경우 경고 메시지를 출력합니다.
-이 노드는 주어진 맵과 센서 데이터를 사용하여 로봇의 위치를 추정하기 위해 입자 필터 및 TF 변환을 활용합니다. 각 함수는 센서 입력, 맵 업데이트 및 사용자 상호 작용을 기반으로 필터 상태를 유지하고 업데이트하는 역할을 수행합니다.
-*/
