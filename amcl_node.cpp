@@ -63,6 +63,8 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
 #include "message_filters/subscriber.h"
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 
 // Dynamic_reconfigure
 #include "dynamic_reconfigure/server.h"
@@ -77,6 +79,8 @@
 #include <diagnostic_updater/diagnostic_updater.h>
 
 #include <detect_object/detect_object.h>
+
+#include <geometry_msgs/Quaternion.h>
 
 #define NEW_UNIFORM_SAMPLING 1
 
@@ -289,6 +293,8 @@ class AmclNode
     odom_model_t odom_model_type_;
     double init_pose_[3];
     double init_cov_[3];
+
+    double laser_link_yaw;
    
     float camera_x;
     float camera_y;
@@ -1145,13 +1151,24 @@ AmclNode::boundingBoxes3dReceived(const geometry_msgs::PoseStamped camera){
    camera_point.pose.orientation.z = camera.pose.orientation.z;
    camera_point.pose.orientation.w = camera.pose.orientation.w;
 
-   ROS_WARN("amcl x:%f,y:%f, yaw:%f",camera_x,camera_y);
-
    geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time::now(), ros::Duration(1.0));
    tf2::doTransform(camera_point, camera_to_laser_point, transformStamped);
-   modify = true;
- 
-}
+  
+   geometry_msgs::Quaternion orientaion = camera.pose.orientation;
+
+   tf2::Quaternion q(orientaion.x, orientaion.y, orientaion.z, orientaion.w);
+
+   double roll, pitch;
+   tf2::Matrix3x3(q).getRPY(roll, pitch, laser_link_yaw);
+
+   if(!boundBox_sub_){
+     modify = false;
+   }else{
+     modify = true;
+   }
+
+   ROS_WARN("amcl x:%f, y:%f, yaw:%f",camera_to_laser_point.pose.orientation.x,camera_to_laser_point.pose.orientation.y,laser_link_yaw);
+}    
 
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
@@ -1372,6 +1389,13 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       cloud_msg.poses.resize(set->sample_count);
       for(int i=0;i<set->sample_count;i++)
       {
+
+        if(modify){
+         set->samples[i].pose.v[0] = camera_to_laser_point.pose.position.x;
+         set->samples[i].pose.v[1] = camera_to_laser_point.pose.position.y;
+         set->samples[i].pose.v[2] = laser_link_yaw;
+         }
+
         cloud_msg.poses[i].position.x = set->samples[i].pose.v[0];
         cloud_msg.poses[i].position.y = set->samples[i].pose.v[1];
         cloud_msg.poses[i].position.z = 0;
@@ -1436,7 +1460,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       hyps[max_weight_hyp].pf_pose_mean.v[1] = camera_to_laser_point.pose.position.y;
       }
 
-      modify = false;
       // Copy in the pose
       p.pose.pose.position.x = hyps[max_weight_hyp].pf_pose_mean.v[0];
       p.pose.pose.position.y = hyps[max_weight_hyp].pf_pose_mean.v[1];
