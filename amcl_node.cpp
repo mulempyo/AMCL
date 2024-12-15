@@ -63,8 +63,6 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
 #include "message_filters/subscriber.h"
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2/LinearMath/Matrix3x3.h>
 
 // Dynamic_reconfigure
 #include "dynamic_reconfigure/server.h"
@@ -77,10 +75,6 @@
 
 // For monitoring the estimator
 #include <diagnostic_updater/diagnostic_updater.h>
-
-#include <detect_object/detect_object.h>
-
-#include <geometry_msgs/Quaternion.h>
 
 #define NEW_UNIFORM_SAMPLING 1
 
@@ -176,7 +170,7 @@ class AmclNode
     bool setMapCallback(nav_msgs::SetMap::Request& req,
                         nav_msgs::SetMap::Response& res);
 
-    void boundingBoxes3dReceived(const geometry_msgs::PoseStamped camera);
+    void safeReceived(const geometry_msgs::PoseStamped safe);
     void laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan);
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
@@ -188,13 +182,13 @@ class AmclNode
     void updatePoseFromServer();
     void applyInitialPose();
 
-    //parameter for what odom to use
+    //parameter for which odom to use
     std::string odom_frame_id_;
 
     //paramater to store latest odom pose
     geometry_msgs::PoseStamped latest_odom_pose_;
 
-    //parameter for what base to use
+    //parameter for which base to use
     std::string base_frame_id_;
     std::string global_frame_id_;
 
@@ -206,7 +200,6 @@ class AmclNode
     ros::Duration save_pose_period;
 
     geometry_msgs::PoseWithCovarianceStamped last_published_pose;
-    geometry_msgs::PoseStamped camera_to_laser_point;
 
     map_t* map_;
     char* mapdata;
@@ -263,9 +256,9 @@ class AmclNode
     ros::ServiceServer set_map_srv_;
     ros::Subscriber initial_pose_sub_old_;
     ros::Subscriber map_sub_;
-    ros::Subscriber boundBox_sub_;
+    ros::Subscriber safe_sub_;
+    ros::Publisher amcl_pub_;
 
-    detect::Detect detect_object_;
     diagnostic_updater::Updater diagnosic_updater_;
     void standardDeviationDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& diagnostic_status);
     double std_warn_level_x_;
@@ -275,7 +268,6 @@ class AmclNode
     amcl_hyp_t* initial_pose_hyp_;
     bool first_map_received_;
     bool first_reconfigure_call_;
-    bool modify = false;
 
     boost::recursive_mutex configuration_mutex_;
     dynamic_reconfigure::Server<amcl::AMCLConfig> *dsrv_;
@@ -293,15 +285,16 @@ class AmclNode
     odom_model_t odom_model_type_;
     double init_pose_[3];
     double init_cov_[3];
-
-    double laser_link_yaw;
-   
-    float camera_x;
-    float camera_y;
-    float camera_yaw;
     laser_model_t laser_model_type_;
     bool tf_broadcast_;
+    bool force_update_after_initialpose_;
+    bool force_update_after_set_map_;
     bool selective_resampling_;
+    bool modify;
+
+    double safe_yaw;
+
+    geometry_msgs::PoseStamped safe_1;
 
     void reconfigureCB(amcl::AMCLConfig &config, uint32_t level);
 
@@ -462,6 +455,8 @@ AmclNode::AmclNode() :
   private_nh_.param("recovery_alpha_slow", alpha_slow_, 0.001);
   private_nh_.param("recovery_alpha_fast", alpha_fast_, 0.1);
   private_nh_.param("tf_broadcast", tf_broadcast_, true);
+  private_nh_.param("force_update_after_initialpose", force_update_after_initialpose_, false);
+  private_nh_.param("force_update_after_set_map", force_update_after_set_map_, false);
 
   // For diagnostics
   private_nh_.param("std_warn_level_x", std_warn_level_x_, 0.2);
@@ -505,9 +500,9 @@ AmclNode::AmclNode() :
   laser_scan_filter_->registerCallback(boost::bind(&AmclNode::laserReceived,
                                                    this, _1));
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
-
-  boundBox_sub_ = nh_.subscribe("object_detection_true", 10, &AmclNode::boundingBoxes3dReceived, this);
-
+   
+  safe_sub_ = nh_.subscribe("/move_base/DWAPlannerROS/safe_mode", 10, &AmclNode::safeReceived,this);
+  
   if(use_map_topic_) {
     map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
     ROS_INFO("Subscribed to map topic.");
@@ -603,6 +598,8 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
   alpha_slow_ = config.recovery_alpha_slow;
   alpha_fast_ = config.recovery_alpha_fast;
   tf_broadcast_ = config.tf_broadcast;
+  force_update_after_initialpose_ = config.force_update_after_initialpose;
+  force_update_after_set_map_ = config.force_update_after_set_map;
 
   do_beamskip_= config.do_beamskip; 
   beam_skip_distance_ = config.beam_skip_distance; 
@@ -715,7 +712,7 @@ void AmclNode::runFromBag(const std::string &in_bag_fn, bool trigger_global_loca
         break;
       }
     }
-    ROS_INFO("Waiting for map...");
+    ROS_INFO("Waiting for the map...");
     ros::getGlobalCallbackQueue()->callAvailable(ros::WallDuration(1.0));
   }
 
@@ -995,7 +992,7 @@ AmclNode::freeMapDependentMemory()
 
 /**
  * Convert an OccupancyGrid map message into the internal
- * representation.  This allocates a map_t and returns it.
+ * representation. This allocates a map_t and returns it.
  */
 map_t*
 AmclNode::convertMap( const nav_msgs::OccupancyGrid& map_msg )
@@ -1047,7 +1044,7 @@ AmclNode::getOdomPose(geometry_msgs::PoseStamped& odom_pose,
   {
     this->tf_->transform(ident, odom_pose, odom_frame_id_);
   }
-  catch(tf2::TransformException e)
+  catch(const tf2::TransformException& e)
   {
     ROS_WARN("Failed to compute odom pose, skipping scan (%s)", e.what());
     return false;
@@ -1130,45 +1127,26 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 {
   handleMapMessage(req.map);
   handleInitialPoseMessage(req.initial_pose);
+  if (force_update_after_set_map_)
+  {
+    m_force_update = true;
+  }
   res.success = true;
   return true;
 }
 
-void
-AmclNode::boundingBoxes3dReceived(const geometry_msgs::PoseStamped camera){
+void 
+AmclNode::safeReceived(const geometry_msgs::PoseStamped safe){
+  ROS_WARN("in amcl node");
 
-   camera_x = camera.pose.position.x;
-   camera_y = camera.pose.position.y;
-   
-   geometry_msgs::PoseStamped camera_point;
-   camera_point.header.frame_id = "camera_link";
-   camera_point.header.stamp = ros::Time::now();
-   camera_point.pose.position.x = camera_x;
-   camera_point.pose.position.y = camera_y;
+  safe_1 = safe;
+  geometry_msgs::Quaternion orientation = safe.pose.orientation;
+  tf2::Quaternion q(orientation.x, orientation.y, orientation.z, orientation.w);
 
-   camera_point.pose.orientation.x = camera.pose.orientation.x;
-   camera_point.pose.orientation.y = camera.pose.orientation.y;
-   camera_point.pose.orientation.z = camera.pose.orientation.z;
-   camera_point.pose.orientation.w = camera.pose.orientation.w;
-
-   geometry_msgs::TransformStamped transformStamped = tf_->lookupTransform("laser_link", "camera_link", ros::Time::now(), ros::Duration(1.0));
-   tf2::doTransform(camera_point, camera_to_laser_point, transformStamped);
-  
-   geometry_msgs::Quaternion orientaion = camera.pose.orientation;
-
-   tf2::Quaternion q(orientaion.x, orientaion.y, orientaion.z, orientaion.w);
-
-   double roll, pitch;
-   tf2::Matrix3x3(q).getRPY(roll, pitch, laser_link_yaw);
-
-   if(!boundBox_sub_){
-     modify = false;
-   }else{
-     modify = true;
-   }
-
-   ROS_WARN("amcl x:%f, y:%f, yaw:%f",camera_to_laser_point.pose.orientation.x,camera_to_laser_point.pose.orientation.y,laser_link_yaw);
-}    
+  double roll, pitch;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, safe_yaw);
+  modify = true;
+}
 
 void
 AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
@@ -1199,7 +1177,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     {
       this->tf_->transform(ident, laser_pose, base_frame_id_);
     }
-    catch(tf2::TransformException& e)
+    catch(const tf2::TransformException& e)
     {
       ROS_ERROR("Couldn't transform from %s to %s, "
                 "even though the message notifier is in use",
@@ -1322,7 +1300,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       tf_->transform(min_q, min_q, base_frame_id_);
       tf_->transform(inc_q, inc_q, base_frame_id_);
     }
-    catch(tf2::TransformException& e)
+    catch(const tf2::TransformException& e)
     {
       ROS_WARN("Unable to transform min/max laser angles into base frame: %s",
                e.what());
@@ -1347,6 +1325,12 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       range_min = std::max(laser_scan->range_min, (float)laser_min_range_);
     else
       range_min = laser_scan->range_min;
+
+    if(ldata.range_max <= 0.0 || range_min < 0.0) {
+      ROS_ERROR("range_max or range_min from laser is negative! ignore this message.");
+      return; // ignore this.
+    }
+
     // The AMCLLaserData destructor will free this memory
     ldata.ranges = new double[ldata.range_count][2];
     ROS_ASSERT(ldata.ranges);
@@ -1356,6 +1340,8 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       // readings to max range.
       if(laser_scan->ranges[i] <= range_min)
         ldata.ranges[i][0] = ldata.range_max;
+      else if(laser_scan->ranges[i] > ldata.range_max)
+        ldata.ranges[i][0] = std::numeric_limits<decltype(ldata.range_max)>::max();
       else
         ldata.ranges[i][0] = laser_scan->ranges[i];
       // Compute bearing
@@ -1391,11 +1377,12 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       {
 
         if(modify){
-         set->samples[i].pose.v[0] = camera_to_laser_point.pose.position.x;
-         set->samples[i].pose.v[1] = camera_to_laser_point.pose.position.y;
-         set->samples[i].pose.v[2] = laser_link_yaw;
-         }
-
+          ROS_WARN("in amcl node, posearray");
+          set->samples[i].pose.v[0] = safe_1.pose.position.x;
+          set->samples[i].pose.v[1] = safe_1.pose.position.y;
+          set->samples[i].pose.v[2] = safe_yaw;
+        }
+   
         cloud_msg.poses[i].position.x = set->samples[i].pose.v[0];
         cloud_msg.poses[i].position.y = set->samples[i].pose.v[1];
         cloud_msg.poses[i].position.z = 0;
@@ -1454,16 +1441,16 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       // Fill in the header
       p.header.frame_id = global_frame_id_;
       p.header.stamp = laser_scan->header.stamp;
-
+     
       if(modify){
-      hyps[max_weight_hyp].pf_pose_mean.v[0] = camera_to_laser_point.pose.position.x;
-      hyps[max_weight_hyp].pf_pose_mean.v[1] = camera_to_laser_point.pose.position.y;
+        ROS_WARN("in amcl node, weight");
+        hyps[max_weight_hyp].pf_pose_mean.v[0] = safe_1.pose.position.x;
+        hyps[max_weight_hyp].pf_pose_mean.v[1] = safe_1.pose.position.y;
       }
-
       // Copy in the pose
       p.pose.pose.position.x = hyps[max_weight_hyp].pf_pose_mean.v[0];
       p.pose.pose.position.y = hyps[max_weight_hyp].pf_pose_mean.v[1];
-      
+
       tf2::Quaternion q;
       q.setRPY(0, 0, hyps[max_weight_hyp].pf_pose_mean.v[2]);
       tf2::convert(q, p.pose.pose.orientation);
@@ -1519,7 +1506,7 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
 
         this->tf_->transform(tmp_tf_stamped, odom_to_map, odom_frame_id_);
       }
-      catch(tf2::TransformException)
+      catch(const tf2::TransformException&)
       {
         ROS_DEBUG("Failed to subtract base to odom transform");
         return;
@@ -1582,6 +1569,10 @@ void
 AmclNode::initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg)
 {
   handleInitialPoseMessage(*msg);
+  if (force_update_after_initialpose_)
+  {
+    m_force_update = true;
+  }
 }
 
 void
@@ -1607,13 +1598,12 @@ AmclNode::handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStampe
   geometry_msgs::TransformStamped tx_odom;
   try
   {
-    ros::Time now = ros::Time::now();
     // wait a little for the latest tf to become available
     tx_odom = tf_->lookupTransform(base_frame_id_, msg.header.stamp,
                                    base_frame_id_, ros::Time::now(),
                                    odom_frame_id_, ros::Duration(0.5));
   }
-  catch(tf2::TransformException e)
+  catch(const tf2::TransformException& e)
   {
     // If we've never sent a transform, then this is normal, because the
     // global_frame_id_ frame doesn't exist.  We only care about in-time
