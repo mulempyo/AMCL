@@ -1360,9 +1360,8 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       for(int i=0;i<set->sample_count;i++)
        {
         if(modify){
-        ROS_WARN("start posearray");
-        set->samples[i].pose.v[0] = safe_1.pose.position.x;
-        set->samples[i].pose.v[1] = safe_1.pose.position.y;
+        set->samples[i].pose.v[0] += safe_1.pose.position.x;
+        set->samples[i].pose.v[1] += safe_1.pose.position.y;
         }
         cloud_msg.poses[i].position.x = set->samples[i].pose.v[0];
         cloud_msg.poses[i].position.y = set->samples[i].pose.v[1];
@@ -1425,9 +1424,8 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
       p.header.frame_id = global_frame_id_;
       p.header.stamp = laser_scan->header.stamp;
       if(modify){
-      ROS_WARN("start pose");
-      hyps[max_weight_hyp].pf_pose_mean.v[0] = safe_2.pose.position.x;
-      hyps[max_weight_hyp].pf_pose_mean.v[1] = safe_2.pose.position.y;
+      hyps[max_weight_hyp].pf_pose_mean.v[0] += safe_2.pose.position.x;
+      hyps[max_weight_hyp].pf_pose_mean.v[1] += safe_2.pose.position.y;
       }
       // Copy in the pose
       p.pose.pose.position.x = hyps[max_weight_hyp].pf_pose_mean.v[0];
