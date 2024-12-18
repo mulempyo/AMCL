@@ -259,6 +259,7 @@ class AmclNode
     ros::Subscriber map_sub_;
     ros::Subscriber safe_sub_;
     ros::Publisher amcl_pub_;
+    ros::Publisher robot_localization_pub_;
 
     diagnostic_updater::Updater diagnosic_updater_;
     void standardDeviationDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& diagnostic_status);
@@ -477,7 +478,7 @@ AmclNode::AmclNode() :
   tf_.reset(new tf2_ros::Buffer());
   tfl_.reset(new tf2_ros::TransformListener(*tf_));
 
-  amcl_pub_ = nh_.advertise<std_msgs::Float64>("/safe",10);
+  amcl_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/safe",10);
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
   global_loc_srv_ = nh_.advertiseService("global_localization", 
@@ -1127,16 +1128,13 @@ AmclNode::setMapCallback(nav_msgs::SetMap::Request& req,
 
 void 
 AmclNode::safeReceived(geometry_msgs::PoseStamped safe){
-  ROS_WARN("in amcl node");
+  
 
   safe_1 = safe;
   safe_2 = safe;
 
   modify = true;
 
-  if(modify){
-    ROS_WARN("modify true");
-  }
 }
 
 void
@@ -1550,7 +1548,6 @@ AmclNode::laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan)
     amcl_pub_.publish(i);
     modify = false;
   }
-  
 }
 
 void
